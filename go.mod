@@ -3,6 +3,7 @@ module github.com/hightemp/go_mcp_server_tinvest
 go 1.23.5
 
 require (
+	github.com/joho/godotenv v1.5.1
 	github.com/mark3labs/mcp-go v0.42.0
 	github.com/tinkoff/invest-api-go-sdk v1.4.6
 )
