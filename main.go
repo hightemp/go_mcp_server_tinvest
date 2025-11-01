@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -191,6 +192,43 @@ func main() {
 		return portfolioHandler(ctx, req, ic)
 	})
 
+	// Market Data инструменты
+	lastPriceTool := mcp.NewTool("last_price",
+		mcp.WithDescription("Последняя цена инструмента"),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Тикер/название или FIGI инструмента")),
+	)
+	mcpServer.AddTool(lastPriceTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return lastPriceHandler(ctx, req, ic)
+	})
+
+	orderbookTool := mcp.NewTool("orderbook",
+		mcp.WithDescription("Стакан заявок по инструменту"),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Тикер/название или FIGI инструмента")),
+		mcp.WithNumber("depth", mcp.Required(), mcp.Description("Глубина стакана (1-50)")),
+	)
+	mcpServer.AddTool(orderbookTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return orderbookHandler(ctx, req, ic)
+	})
+
+	candlesTool := mcp.NewTool("candles",
+		mcp.WithDescription("Исторические свечи по инструменту за период"),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Тикер/название или FIGI инструмента")),
+		mcp.WithString("from", mcp.Required(), mcp.Description("Начало периода (RFC3339), напр. 2024-01-01T00:00:00Z")),
+		mcp.WithString("to", mcp.Required(), mcp.Description("Конец периода (RFC3339), напр. 2024-01-31T23:59:59Z")),
+		mcp.WithString("interval", mcp.Required(), mcp.Description("Интервал: 1m,5m,15m,1h,1d")),
+	)
+	mcpServer.AddTool(candlesTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return candlesHandler(ctx, req, ic)
+	})
+
+	tradingStatusTool := mcp.NewTool("trading_status",
+		mcp.WithDescription("Статус торгов по инструменту"),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Тикер/название или FIGI инструмента")),
+	)
+	mcpServer.AddTool(tradingStatusTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return tradingStatusHandler(ctx, req, ic)
+	})
+
 	// Запуск транспорта
 	if transport == "sse" {
 		sseServer := server.NewSSEServer(mcpServer, server.WithBaseURL(fmt.Sprintf("http://%s:%s", host, port)))
@@ -347,7 +385,200 @@ func portfolioHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestCl
 	return mcp.NewToolResultText("Текущий портфель:\n" + formatList(lines)), nil
 }
 
+// Market Data handlers
+type InstrumentRef struct {
+	Figi   string
+	Ticker string
+	Name   string
+}
+
+func findInstrumentRef(ic *InvestClient, q string) (*InstrumentRef, error) {
+	instruments := ic.sdk.NewInstrumentsServiceClient()
+	resp, err := instruments.FindInstrument(q)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка поиска инструмента: %w", err)
+	}
+	if len(resp.GetInstruments()) == 0 {
+		return nil, fmt.Errorf("инструмент по запросу %q не найден", q)
+	}
+	it := resp.GetInstruments()[0]
+	return &InstrumentRef{
+		Figi:   it.GetFigi(),
+		Ticker: it.GetTicker(),
+		Name:   it.GetName(),
+	}, nil
+}
+
+func lastPriceHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestClient) (*mcp.CallToolResult, error) {
+	q, _ := req.RequireString("query")
+	inst, err := findInstrumentRef(ic, q)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	md := ic.sdk.NewMarketDataServiceClient()
+	lpResp, err := md.GetLastPrices([]string{inst.Figi})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Ошибка получения последней цены: %v", err)), nil
+	}
+	lps := lpResp.GetLastPrices()
+	if len(lps) == 0 {
+		return mcp.NewToolResultText("Нет данных о последней цене"), nil
+	}
+	lp := lps[0]
+	price := lp.GetPrice()
+	ts := lp.GetTime().AsTime()
+	text := fmt.Sprintf("%s (%s), FIGI %s — последняя цена: %s, время: %s",
+		inst.Name, inst.Ticker, inst.Figi, quotationToStr(price), ts.Format(time.RFC3339))
+	return mcp.NewToolResultText(text), nil
+}
+
+func orderbookHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestClient) (*mcp.CallToolResult, error) {
+	q, _ := req.RequireString("query")
+	depthF, _ := req.RequireFloat("depth")
+	if depthF < 1 {
+		depthF = 1
+	}
+	if depthF > 50 {
+		depthF = 50
+	}
+	depth := int32(depthF)
+
+	inst, err := findInstrumentRef(ic, q)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	md := ic.sdk.NewMarketDataServiceClient()
+	ob, err := md.GetOrderBook(inst.Figi, depth)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Ошибка получения стакана: %v", err)), nil
+	}
+
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Стакан %s (%s), FIGI %s, глубина %d", inst.Name, inst.Ticker, inst.Figi, depth))
+	lines = append(lines, "BIDS (покупка):")
+	for i, b := range ob.GetBids() {
+		if int32(i) >= depth {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("  #%d %s × %d", i+1, quotationToStr(b.GetPrice()), b.GetQuantity()))
+	}
+	lines = append(lines, "ASKS (продажа):")
+	for i, a := range ob.GetAsks() {
+		if int32(i) >= depth {
+			break
+		}
+		lines = append(lines, fmt.Sprintf("  #%d %s × %d", i+1, quotationToStr(a.GetPrice()), a.GetQuantity()))
+	}
+
+	return mcp.NewToolResultText(strings.Join(lines, "\n")), nil
+}
+
+func candlesHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestClient) (*mcp.CallToolResult, error) {
+	q, _ := req.RequireString("query")
+	fromStr, _ := req.RequireString("from")
+	toStr, _ := req.RequireString("to")
+	intervalStr, _ := req.RequireString("interval")
+
+	from, err := time.Parse(time.RFC3339, fromStr)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Некорректный формат from: %v", err)), nil
+	}
+	to, err := time.Parse(time.RFC3339, toStr)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Некорректный формат to: %v", err)), nil
+	}
+	if !to.After(from) {
+		return mcp.NewToolResultError("Параметр 'to' должен быть позже, чем 'from'"), nil
+	}
+	interval, err := parseCandleInterval(intervalStr)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	inst, err := findInstrumentRef(ic, q)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	md := ic.sdk.NewMarketDataServiceClient()
+	candlesResp, err := md.GetCandles(inst.Figi, interval, from, to)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Ошибка получения свечей: %v", err)), nil
+	}
+	candles := candlesResp.GetCandles()
+	if len(candles) == 0 {
+		return mcp.NewToolResultText("Свечи не найдены за указанный период"), nil
+	}
+
+	var out []string
+	out = append(out, fmt.Sprintf("Свечи %s (%s) FIGI %s, %s, %s → %s, всего: %d",
+		inst.Name, inst.Ticker, inst.Figi, strings.ToUpper(intervalStr),
+		from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339), len(candles),
+	))
+	// Выведем до 50 строк, чтобы не шуметь
+	limit := len(candles)
+	if limit > 50 {
+		limit = 50
+	}
+	for i := 0; i < limit; i++ {
+		c := candles[i]
+		ts := c.GetTime().AsTime().UTC().Format(time.RFC3339)
+		o := quotationToStr(c.GetOpen())
+		h := quotationToStr(c.GetHigh())
+		l := quotationToStr(c.GetLow())
+		cl := quotationToStr(c.GetClose())
+		v := c.GetVolume()
+		out = append(out, fmt.Sprintf(" - %s  O:%s H:%s L:%s C:%s V:%d", ts, o, h, l, cl, v))
+	}
+	if len(candles) > limit {
+		out = append(out, fmt.Sprintf(" ... и ещё %d свечей", len(candles)-limit))
+	}
+
+	return mcp.NewToolResultText(strings.Join(out, "\n")), nil
+}
+
+func tradingStatusHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestClient) (*mcp.CallToolResult, error) {
+	q, _ := req.RequireString("query")
+	inst, err := findInstrumentRef(ic, q)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	md := ic.sdk.NewMarketDataServiceClient()
+	st, err := md.GetTradingStatus(inst.Figi)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("Ошибка получения статуса торгов: %v", err)), nil
+	}
+
+	text := fmt.Sprintf("Статус торгов для %s (%s), FIGI %s: %v",
+		inst.Name, inst.Ticker, inst.Figi, st.GetTradingStatus())
+	return mcp.NewToolResultText(text), nil
+}
+
 // Вспомогательные функции
+func parseCandleInterval(s string) (pb.CandleInterval, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1m", "1min":
+		return pb.CandleInterval_CANDLE_INTERVAL_1_MIN, nil
+	case "5m", "5min":
+		return pb.CandleInterval_CANDLE_INTERVAL_5_MIN, nil
+	case "15m", "15min":
+		return pb.CandleInterval_CANDLE_INTERVAL_15_MIN, nil
+	case "1h", "60m":
+		return pb.CandleInterval_CANDLE_INTERVAL_HOUR, nil
+	case "1d", "1day", "day", "d":
+		return pb.CandleInterval_CANDLE_INTERVAL_DAY, nil
+	default:
+		return 0, fmt.Errorf("неизвестный interval %q. Допустимо: 1m,5m,15m,1h,1d", s)
+	}
+}
+
+func quotationToStr(q *pb.Quotation) string {
+	return decimalToStr(q.GetUnits(), q.GetNano())
+}
+
 func formatList(items []string) string {
 	result := ""
 	for _, item := range items {
