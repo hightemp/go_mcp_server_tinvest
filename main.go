@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/joho/godotenv"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/tinkoff/invest-api-go-sdk/investgo"
 	pb "github.com/tinkoff/invest-api-go-sdk/proto"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // stdLogger — простой логгер, удовлетворяющий investgo.Logger
@@ -35,12 +38,16 @@ func NewInvestClient() (*InvestClient, error) {
 	}
 
 	token := os.Getenv("TINKOFF_TOKEN")
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return nil, fmt.Errorf("переменная окружения TINKOFF_TOKEN не задана")
 	}
 
 	endpoint := os.Getenv("TINKOFF_ENDPOINT")
+	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
+		// Замечание: убедитесь, что endpoint соответствует типу токена (prod vs sandbox)
+		// Для sandbox используйте: sandbox-invest-public-api.tinkoff.ru:443
 		endpoint = "invest-public-api.tinkoff.ru:443"
 	}
 
@@ -55,17 +62,56 @@ func NewInvestClient() (*InvestClient, error) {
 		EndPoint: endpoint,
 		AppName:  appName,
 	}
+	// ВАЖНО: чтобы investgo.NewClient не дергал SandboxService при пустом AccountId (что ломает прод с 40003),
+	// заполним AccountId из окружения заранее.
+	accEnv := strings.TrimSpace(os.Getenv("TINKOFF_ACCOUNT_ID"))
+	if accEnv != "" {
+		conf.AccountId = accEnv
+		log.Printf("AccountID из окружения: %s", accEnv)
+	}
 
 	cli, err := investgo.NewClient(ctx, conf, stdLogger{})
 	if err != nil {
 		return nil, fmt.Errorf("ошибка инициализации клиента InvestAPI: %w", err)
 	}
 
+	// Определяем AccountID:
+	// 1) из окружения TINKOFF_ACCOUNT_ID
+	// 2) из конфигурации клиента (если там задан)
+	// 3) автоматически выбираем первый OPEN счёт через UsersService
+	accID := os.Getenv("TINKOFF_ACCOUNT_ID")
+	if accID == "" {
+		if cli.Config.AccountId != "" {
+			accID = cli.Config.AccountId
+		} else {
+			accID, err = resolveAccountID(cli)
+			if err != nil {
+				return nil, fmt.Errorf("не удалось определить AccountID: %w", err)
+			}
+		}
+	}
+	log.Printf("Используется endpoint: %s, app: %s", endpoint, appName)
+	log.Printf("Выбран AccountID: %s", accID)
+
 	return &InvestClient{
 		ctx:       ctx,
 		sdk:       cli,
-		accountID: cli.Config.AccountId,
+		accountID: accID,
 	}, nil
+}
+
+func resolveAccountID(cli *investgo.Client) (string, error) {
+	users := cli.NewUsersServiceClient()
+	resp, err := users.GetAccounts()
+	if err != nil {
+		return "", fmt.Errorf("ошибка получения списка счетов: %w", err)
+	}
+	for _, acc := range resp.GetAccounts() {
+		if acc.GetStatus() == pb.AccountStatus_ACCOUNT_STATUS_OPEN {
+			return acc.GetId(), nil
+		}
+	}
+	return "", fmt.Errorf("не найден ни один счёт в статусе OPEN")
 }
 
 func (c *InvestClient) Close() { _ = c.sdk.Stop() }
@@ -274,8 +320,14 @@ func sellHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestClient)
 
 func portfolioHandler(ctx context.Context, req mcp.CallToolRequest, ic *InvestClient) (*mcp.CallToolResult, error) {
 	ops := ic.sdk.NewOperationsServiceClient()
+	if ic.accountID == "" {
+		return mcp.NewToolResultError("Ошибка получения портфеля: AccountID не задан. Укажите переменную окружения TINKOFF_ACCOUNT_ID либо откройте счёт и перезапустите сервер."), nil
+	}
 	pf, err := ops.GetPortfolio(ic.accountID, pb.PortfolioRequest_CurrencyRequest(0))
 	if err != nil {
+		if s, ok := status.FromError(err); ok && s.Code() == codes.NotFound {
+			return mcp.NewToolResultError("Ошибка получения портфеля: счёт не найден (NotFound/50004). Проверьте: корректность AccountID, соответствие endpoint среде (sandbox vs prod), и права токена."), nil
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("Ошибка получения портфеля: %v", err)), nil
 	}
 	var lines []string
