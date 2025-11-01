@@ -26,10 +26,8 @@ APP_NAME=go-mcp-tinvest
 Критично: токен и эндпоинт должны соответствовать среде (иначе Unauthenticated 40003). Для портфеля укажите корректный `TINKOFF_ACCOUNT_ID` (иначе NotFound 50004).
 
 ## Запуск
-- stdio: `make run`
-- SSE: `make run-sse HOST=localhost PORT=8100` и подключение к http://HOST:PORT/sse
-
-Коротко об инструментах MCP: search_stocks, search_bonds, search_funds, buy, sell, portfolio.
+- stdio (консоль): `make run`
+- SSE (http сервер, server side events): `make run-sse HOST=localhost PORT=8100` и подключение к http://HOST:PORT/sse
 
 ## MCP инструменты
 
